@@ -1,6 +1,5 @@
 #! /usr/bin/perl
 
-use Date::Parse qw(str2time);
 use File::Basename qw(basename);
 use File::Slurp;
 use Getopt::Long;
@@ -12,7 +11,6 @@ use warnings;
 # global options, many configurable via Getopt::Long
 #--------------------------------------------------------------------------------
 my $AUTHOR    = 'John Hart <john.hart@ihance.com>';
-my $TZ        = '-0800';
 my $BRANCH    = 'master';
 my $BATCHSIZE = 10;
 my $MARKS     = $ENV{HOME} . '/marks';
@@ -111,11 +109,12 @@ sub print_preamble {
 	my ($prev) = read_marks($MARKS);
 	my $mark = 1 + ($prev || 0);
 
-	$date = str2time($date);
+	# translates a p4 date (2011/12/13 16:32:43) into git epoch-seconds-plus-offset
+	my $gitdate = cmd(qq{date -j -f "%Y/%m/%d %H:%M:%S" '$date' "+%s %z"});
 
 	print "commit refs/heads/$BRANCH\n";
 	print "mark :$mark\n";
-	print "committer $AUTHOR $date $TZ\n";
+	print "committer $AUTHOR $gitdate\n";
 	print_txt("$desc\n\n[Perforce change $cl]\n");
 	print "from :$prev\n" if $prev;
 	print "deleteall\n";
@@ -150,7 +149,7 @@ sub git_dump {
 # helpers
 #--------------------------------------------------------------------------------
 sub uniq { my %uniq = map { $_ => 1 } @_; keys(%uniq); }
-sub hdr  { printf("%s\n%s\n%1\$s\n", '-'x80, @_);       }
+sub hdr  { printf("%s\n%s\n%1\$s\n", '-'x80, @_);      }
 
 sub redir_io {
 	my ($func, $redir_to) = @_;
@@ -212,11 +211,11 @@ sub get_opts {
 	
   GetOptions(
   	 'author=s'   => \$AUTHOR
-  	,'timezone=s' => \$TZ
   	,'branch=s'   => \$BRANCH
   	,'mark=s' 	  => \$MARKS
   	,'prefix=s'   => \$PREFIX
   	,'change=i'   => \$CHANGE
+  	,'wait=i'     => \$P4WAIT
   	,'debug=s'    => \$D
   	,'verbose'    => \$V
   	,'help|?'  	  => \$help) or $help = 1;
@@ -228,6 +227,7 @@ sub get_opts {
 
 	@DIRS = @ARGV or help_exit("Must specify at least one directory!");
 	map { -d or help_exit("No such directory: $_") } @DIRS;
+	map { s~/$~~ } @DIRS; # don't want trailing "/" in our dirs
 
 	$PREFIX ||= longest_common_prefix(@DIRS);
 	}
@@ -246,7 +246,7 @@ Usage: $name <options> DIR1 [DIR2, ...]
 Options:
 
   -a, --author   Author name to use for all commits
-  -t, --timezone P4 timezone, necessary to give git the right timestamps [ -0800 ]
+
   -b, --branch   Git branch to import into [ master ]
 
   -m, --marks    git marks file [ ~/marks ]
@@ -255,8 +255,14 @@ Options:
   -p, --prefix   Directory prefix to strip from DIRS when importing
                  If not specified, uses the longest common prefix of the DIRS
 
-  -d, --debug    debug mode - provide a filename to dump to, rather than piping
-                 to git --fast-import
+  -d, --debug    debug mode - append the p4 export to this file, rather than
+                 rather than piping to git --fast-import.  You could cat this
+                 file to fast-import later to get the same end result.
+
+  -w, --wait     Initial p4 command timeout in seconds [ 30 ].
+                 p4 hangs a lot, so p4 commands are retried if they don't complete
+                 within the timeout window.  retries use an exponential backoff
+                 strategy - timeout doubles each retry to a max of 10 minutes.
 
 Import the full P4 history of the given directories into the current git repo.
 
@@ -273,6 +279,15 @@ Examples:
   $name                  -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../oldsrc/bin
 
 Both commands will import "lib" and "bin" at the root of the current git repo.
+
+p4 commands that time out are NOT killed by this script (they are orphaned instead,
+because we use backticks so don't have a child PID to kill), so the following commands
+are useful to kill zombie p4 commands:
+
+# List p4 jobs with a line-number prefix
+lj() { ps -A | grep '\.[0-9][0-9] p4' | f -n . | w; }
+# list-and-kill the first N jobs (run after lj, choose N to avoid current p4 cmd)
+kj() { lj | head -$1 | cut -d' ' -f 1 | sed -e 's~^[0-9]*:~~' | xargs kill -9; }
 
 The following functions are useful when spot-checking your results:
 
