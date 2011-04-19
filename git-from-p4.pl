@@ -1,5 +1,6 @@
 #! /usr/bin/perl
 
+use Cwd;
 use File::Basename qw(basename);
 use File::Slurp;
 use Getopt::Long;
@@ -16,12 +17,16 @@ my $BATCHSIZE = 10;
 my $MARKS     = $ENV{HOME} . '/marks';
 my $P4WAIT    = 30; # initial p4cmd timeout, backs off to 10 minutes
 my $PREFIX;
+my $SPOT;
 my $CHANGE;
 my @DIRS;
 my ($D, $V);
 #--------------------------------------------------------------------------------
 
+
 get_opts();
+
+spot_check($SPOT), exit(0) if $SPOT;
 
 my @cls = p4_get_cls(@DIRS);
 @cls = grep { !$CHANGE || $CHANGE < $_ } @cls;
@@ -29,8 +34,10 @@ map { do_cl_batch($_, @DIRS) } split_list($BATCHSIZE, @cls);
 
 exit(0);
 
+
+
 #--------------------------------------------------------------------------------
-# main
+# main subs
 #--------------------------------------------------------------------------------
 
 # open the GIT output handle as a pipe to git fast import (git_import_cmd())
@@ -47,7 +54,7 @@ sub do_cl {
 	print STDERR "syncing to $cl...\n";
 	my ($date, $desc) = p4_sync($cl, @DIRS);
 	print_preamble($date, $desc, $cl);
-	map { git_dump($_) } @dirs;
+	map { -d and git_dump($_) } @dirs;
 	}
 
 # more elegantly done with recursion, car/cdr style, but call stack gets too deep
@@ -60,6 +67,25 @@ sub split_list {
 		}
 	while (@l);
 	@ret;
+	}
+
+#--------------------------------------------------------------------------------
+# spot check
+#--------------------------------------------------------------------------------
+sub spot_check {
+	my ($co) = @_;
+	cmd("git checkout $co 2> /dev/null");
+	my ($cl) = grep { /^\s+\[Perforce change \d+\]/ } cmd("git log -1 $co");
+	($cl) = ($cl =~ /\s+\[Perforce change (\d+)\]/);
+	p4_sync($cl, @DIRS);
+	map { spot_check_dir($_) } @DIRS;
+	}
+
+sub spot_check_dir {
+	my ($d) = @_;
+	my ($gd) = git_path($_);
+	print("skip - $d\n"), return unless -d $d && -d $gd;
+	system(sprintf('diff -rbq %s %s', $gd, $d)) or print ("good - $gd\n");
 	}
 
 #--------------------------------------------------------------------------------
@@ -78,7 +104,15 @@ sub p4_sync {
 	my ($cl, @dirs) = @_;
 	# note the STDERR redirect & grep to ignore these two warning types
 	p4cmd('p4 sync %s 2>&1 | grep -v -e " - file(s) up to date.$" -e " - no file(s) at that changelist number.$"', join(' ', map { "$_/...\@$cl" } @dirs));
+	p4_clean(@dirs);
 	p4_desc_cl($cl);
+	}
+
+sub p4_clean {
+	my (@dirs) = @_;
+	my $d = cwd();
+	map { -d and chdir($_) and cmd("find . -empty -delete") } @dirs;
+	chdir($d);
 	}
 
 # Extracts a timestamp & changelist description for the given changelist
@@ -106,18 +140,18 @@ sub git_import_cmd {
 
 sub print_preamble {
 	my ($date, $desc, $cl) = @_;
-	my ($prev) = read_marks($MARKS);
-	my $mark = 1 + ($prev || 0);
 
 	# translates a p4 date (2011/12/13 16:32:43) into git epoch-seconds-plus-offset
 	my $gitdate = cmd(qq{date -j -f "%Y/%m/%d %H:%M:%S" '$date' "+%s %z"});
+	chomp($gitdate);
 
 	print "commit refs/heads/$BRANCH\n";
-	print "mark :$mark\n";
+	print "mark :$cl\n";
 	print "committer $AUTHOR $gitdate\n";
 	print_txt("$desc\n\n[Perforce change $cl]\n");
-	print "from :$prev\n" if $prev;
+	print "from :$CHANGE\n" if $CHANGE;
 	print "deleteall\n";
+	$CHANGE = $cl;
 	}
 
 sub read_marks {
@@ -133,11 +167,16 @@ sub print_txt {
 	print "data $len\n$txt";
 	}
 
+sub git_path {
+	my ($f) = @_;
+	$f =~ s~^\Q$PREFIX\E~~;
+	$f;
+	}
+
 sub git_dump {
 	my ($f) = @_;
 	-d $f and return map { git_dump("$f/$_") } read_dir($f);
-	my $gitpath = $f;
-	$gitpath =~ s~^\Q$PREFIX\E~~;
+	my $gitpath = git_path($f);
 
 	my $text = read_file($f);
 	my $mode = -x $f ? '755' : '644';
@@ -216,6 +255,7 @@ sub get_opts {
   	,'prefix=s'   => \$PREFIX
   	,'change=i'   => \$CHANGE
   	,'wait=i'     => \$P4WAIT
+  	,'spot=s'     => \$SPOT
   	,'debug=s'    => \$D
   	,'verbose'    => \$V
   	,'help|?'  	  => \$help) or $help = 1;
@@ -223,10 +263,9 @@ sub get_opts {
 	help_exit() if $help;
 
 
-	$CHANGE || ! -f $MARKS or help_exit("Marks file exists ($MARKS), specify --change to continue");
+	$SPOT || $CHANGE || ! -f $MARKS or help_exit("Marks file exists ($MARKS), specify --change to continue");
 
 	@DIRS = @ARGV or help_exit("Must specify at least one directory!");
-	map { -d or help_exit("No such directory: $_") } @DIRS;
 	map { s~/$~~ } @DIRS; # don't want trailing "/" in our dirs
 
 	$PREFIX ||= longest_common_prefix(@DIRS);
@@ -264,38 +303,23 @@ Options:
                  within the timeout window.  retries use an exponential backoff
                  strategy - timeout doubles each retry to a max of 10 minutes.
 
+  -s, --spot     spotcheck mode - sync both repos to given commit
+
 Import the full P4 history of the given directories into the current git repo.
 
 If a directory has moved in p4, you must provide both the old & new paths as arguments.
 
 As this command must be run from the git directory, the DIR arguments will necessarily
-be prefixed with a bunch of stuff (relative "../../" or absolute paths).  Use the
--p argument to strip off the common bits so your git import is rooted where you want, eg:
+be prefixed with a bunch of stuff (relative "../../" or absolute paths).  By default,
+the longest common prefix of the DIRS will be used, but you can use -p to override this.
 
-Examples:
+examples:
 
   $name -p ../../oldsrc/ -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../oldsrc/bin
 
   $name                  -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../oldsrc/bin
 
 Both commands will import "lib" and "bin" at the root of the current git repo.
-
-p4 commands that time out are NOT killed by this script (they are orphaned instead,
-because we use backticks so don't have a child PID to kill), so the following commands
-are useful to kill zombie p4 commands:
-
-# List p4 jobs with a line-number prefix
-lj() { ps -A | grep '\.[0-9][0-9] p4' | f -n . | w; }
-# list-and-kill the first N jobs (run after lj, choose N to avoid current p4 cmd)
-kj() { lj | head -$1 | cut -d' ' -f 1 | sed -e 's~^[0-9]*:~~' | xargs kill -9; }
-
-The following functions are useful when spot-checking your results:
-
-both_nums() { git log | grep -e '^commit' -e '\\[Perforce change'; }
-
-cl2commit() { both_nums | grep -B1 "change \$1" | head -1 | cut -d' ' -f 2; }
-
-commit2cl() { both_nums | grep -A1 "commit \$1" | tail -1 | sed -e 's~^.*change ~~' -e 's~.\$~~'; }
 
 EOH
 
