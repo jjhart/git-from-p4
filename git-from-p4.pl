@@ -1,6 +1,7 @@
 #! /usr/bin/perl
 
 use Cwd;
+use FindBin qw($Bin);
 use File::Basename qw(basename);
 use File::Slurp;
 use Getopt::Long;
@@ -19,6 +20,7 @@ my $P4WAIT    = 30; # initial p4cmd timeout, backs off to 10 minutes
 my $PREFIX;
 my $SPOT;
 my $CHANGE;
+my $LAST;
 my @DIRS;
 my ($D, $V);
 #--------------------------------------------------------------------------------
@@ -29,7 +31,7 @@ get_opts();
 spot_check($SPOT), exit(0) if $SPOT;
 
 my @cls = p4_get_cls(@DIRS);
-@cls = grep { !$CHANGE || $CHANGE < $_ } @cls;
+@cls = grep { (!$CHANGE || $CHANGE < $_) && (!$LAST || $LAST >= $_) } @cls;
 map { do_cl_batch($_, @DIRS) } split_list($BATCHSIZE, @cls);
 
 exit(0);
@@ -223,23 +225,19 @@ sub cmd {
 	}
 
 
-# p4 hangs alot.  this wrapper for cmd times out, kills, & retries
+# p4 hangs alot.  this wraps cmd in a timeout (in $Bin/timeout)
 sub p4cmd {
-	my (@args) = @_;
+	my ($cmd, @args) = @_;
 
-	my ($wait, @ret) = ($P4WAIT);
-	do {
-		eval {
-			local $SIG{ALRM} = sub { die "alarm\n"; };
-			alarm($wait);
-			@ret = cmd(@args);
-			alarm(0);
-			$wait = 2 * ($wait < 300 ? $wait : 300);
-			};
-		} while ($@ && $@ eq "alarm\n");
-	die($@) if $@ && $@ ne "alarm\n";
+	my ($wait, $i, @ret) = ($P4WAIT);
+	for ($i = 0; $i < 10; $i++) {
+		eval { @ret = cmd($Bin . "/timeout -t $wait $cmd", @args); };
+		$@ or return wantarray ? @ret : join('', @ret);
+		$@ =~ /^Failure executing/ or die($@);
+		$wait = 2 * ($wait < 300 ? $wait : 300);
+		}
 
-	wantarray ? @ret : join('', @ret);
+	die("Quitting after $i tries: $cmd\n");
 	}
 
 #--------------------------------------------------------------------------------
@@ -254,6 +252,7 @@ sub get_opts {
   	,'mark=s' 	  => \$MARKS
   	,'prefix=s'   => \$PREFIX
   	,'change=i'   => \$CHANGE
+  	,'last=i'     => \$LAST
   	,'wait=i'     => \$P4WAIT
   	,'spot=s'     => \$SPOT
   	,'debug=s'    => \$D
@@ -290,6 +289,7 @@ Options:
 
   -m, --marks    git marks file [ ~/marks ]
   -c, --change   p4 changelist # of the last mark; required if marks file exists
+  -l, --last     p4 changelist # to stop after
 
   -p, --prefix   Directory prefix to strip from DIRS when importing
                  If not specified, uses the longest common prefix of the DIRS
