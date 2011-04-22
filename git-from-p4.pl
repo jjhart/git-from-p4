@@ -3,6 +3,7 @@
 use Cwd;
 use FindBin qw($Bin);
 use File::Basename qw(basename);
+use File::Path;
 use File::Slurp;
 use Getopt::Long;
 
@@ -16,13 +17,14 @@ my $AUTHOR    = 'John Hart <john.hart@ihance.com>';
 my $BRANCH    = 'master';
 my $BATCHSIZE = 10;
 my $MARKS     = $ENV{HOME} . '/marks';
-my $P4WAIT    = 30; # initial p4cmd timeout, backs off to 10 minutes
+my $SYNCWAIT  = 240;
 my $PREFIX;
 my $SPOT;
 my $CHANGE;
 my $LAST;
 my @DIRS;
 my ($D, $V);
+my $HELPSTR = helpstr(); # define before getopt so it can show default values
 #--------------------------------------------------------------------------------
 
 
@@ -75,10 +77,10 @@ sub split_list {
 # spot check
 #--------------------------------------------------------------------------------
 sub spot_check {
-	my ($co) = @_;
-	cmd("git checkout $co 2> /dev/null");
-	my ($cl) = grep { /^\s+\[Perforce change \d+\]/ } cmd("git log -1 $co");
-	($cl) = ($cl =~ /\s+\[Perforce change (\d+)\]/);
+	my ($cl) = @_;
+	my $co = readcmd("git log master | grep -e commit -e '\\[Perforce change $cl' | grep -B1 '\\[Perforce change $cl' | cut -d' ' -f 2");
+	while (chomp($co)) {}
+	readcmd("git checkout $co 2> /dev/null");
 	p4_sync($cl, @DIRS);
 	map { spot_check_dir($_) } @DIRS;
 	}
@@ -86,8 +88,10 @@ sub spot_check {
 sub spot_check_dir {
 	my ($d) = @_;
 	my ($gd) = git_path($_);
-	print("skip - $d\n"), return unless -d $d && -d $gd;
-	system(sprintf('diff -rbq %s %s', $gd, $d)) or print ("good - $gd\n");
+	print("::SKIP - $d\n"), return unless -d $d && -d $gd;
+	system(sprintf('diff -rbq %s %s', $gd, $d))
+		? print "::DIFF $gd\n"
+		: print "::GOOD $gd\n";
 	}
 
 #--------------------------------------------------------------------------------
@@ -97,30 +101,36 @@ sub spot_check_dir {
 # get a sorted list of call changelists that touch the given dirs
 sub p4_get_cls {
 	my (@dirs) = @_;
-	sort { $a <=> $b } uniq(map { s~^Change ~~; s~ .*$~~s; $_ } p4cmd('p4 changes -i %s', join(' ', map { "$_/..." } @dirs)));
+	sort { $a <=> $b } uniq(map { s~^Change ~~; s~ .*$~~s; $_ } readcmd2('p4 changes -i %s', join(' ', map { "$_/..." } @dirs)));
 	}
 
 # syncs the given directories to the given CL
 # returns a (date, description) pair for the CL
 sub p4_sync {
 	my ($cl, @dirs) = @_;
-	# note the STDERR redirect & grep to ignore these two warning types
-	p4cmd('p4 sync %s 2>&1 | grep -v -e " - file(s) up to date.$" -e " - no file(s) at that changelist number.$"', join(' ', map { "$_/...\@$cl" } @dirs));
-	p4_clean(@dirs);
+	map { p4_sync_dir($cl, $_) } @dirs;
 	p4_desc_cl($cl);
+	}
+
+# standard sync of the given dir, then removes empty subdirs
+# if standard sync fails, nukes the entire dir and does "p4 sync -f" to re-fetch all
+sub p4_sync_dir {
+	my ($cl, $d) = @_;
+	onfail(sub { timeout($SYNCWAIT, "p4 sync $d/...\@$cl"); p4_clean($d); }) 
+			->(sub { rmtree($d); timeout(4*$SYNCWAIT, "p4 sync -f $d/...\@$cl"); });
 	}
 
 sub p4_clean {
 	my (@dirs) = @_;
 	my $d = cwd();
-	map { -d and chdir($_) and cmd("find . -empty -delete") } @dirs;
+	map { -d and chdir($_) and readcmd("find . -empty -delete") } @dirs;
 	chdir($d);
 	}
 
 # Extracts a timestamp & changelist description for the given changelist
 sub p4_desc_cl {
 	my ($cl) = @_;
-	my $txt = p4cmd('p4 describe -s %s', $cl);
+	my $txt = readcmd2('p4 describe -s %s', $cl);
 	my ($date) = ($txt =~ /^Change $cl by .* on (\d+.*)$/m) or die("Could not parse change $cl: $txt");
 	$txt =~ s~^Affected files \.\.\..*~~ms; # strip entire list of effected files
 	$txt =~ s~^.*\n\n~~m;
@@ -144,7 +154,7 @@ sub print_preamble {
 	my ($date, $desc, $cl) = @_;
 
 	# translates a p4 date (2011/12/13 16:32:43) into git epoch-seconds-plus-offset
-	my $gitdate = cmd(qq{date -j -f "%Y/%m/%d %H:%M:%S" '$date' "+%s %z"});
+	my $gitdate = readcmd(qq{date -j -f "%Y/%m/%d %H:%M:%S" '$date' "+%s %z"});
 	chomp($gitdate);
 
 	print "commit refs/heads/$BRANCH\n";
@@ -215,29 +225,42 @@ sub longest_common_prefix {
 #--------------------------------------------------------------------------------
 # shellouts
 #--------------------------------------------------------------------------------
-sub cmd {
+sub ret {	return wantarray ? @_ : join('', @_);	}
+
+sub readcmd {
 	my ($cmd, @args) = @_;
 	$cmd = sprintf($cmd, @args) if @args;
 	$V and print STDERR "$cmd\n";
 	my @ret = `$cmd`;
 	$? and die("Failure executing '$cmd': $?");
-	wantarray ? @ret : join('', @ret);
+	ret(@ret);
 	}
 
+# try the same command twice if necessary
+sub readcmd2 {
+	my (@args) = @_;
+	onfail(sub { readcmd(@args); })->(sub { readcmd(@args); });
+	}
 
-# p4 hangs alot.  this wraps cmd in a timeout (in $Bin/timeout)
-sub p4cmd {
-	my ($cmd, @args) = @_;
-
-	my ($wait, $i, @ret) = ($P4WAIT);
-	for ($i = 0; $i < 10; $i++) {
-		eval { @ret = cmd($Bin . "/timeout -t $wait $cmd", @args); };
-		$@ or return wantarray ? @ret : join('', @ret);
-		$@ =~ /^Failure executing/ or die($@);
-		$wait = 2 * ($wait < 300 ? $wait : 300);
+# wraps a call/fail/retry loop
+# eg: onfail( $func1 )->( $func2_if_func1_fails )
+sub onfail {
+	my ($f1) = @_;
+	return sub {
+		my ($f2) = @_;
+		my @ret = eval { $f1->(); };
+		$@ or return ret(@ret);
+		print(STDERR "retrying after $@");
+		ret($f2->());
 		}
+	}
 
-	die("Quitting after $i tries: $cmd\n");
+# note - 'timeout' doesn't work in qx/backticks (always waits the full timeout)
+# so we have to use system instead, which is OK b/c we don't need the output
+sub timeout {
+	my ($wait, $cmd, @args) = @_;
+	$cmd = sprintf($cmd, @args) if @args;
+	system("${Bin}/timeout -t $wait $cmd");
 	}
 
 #--------------------------------------------------------------------------------
@@ -253,14 +276,13 @@ sub get_opts {
   	,'prefix=s'   => \$PREFIX
   	,'change=i'   => \$CHANGE
   	,'last=i'     => \$LAST
-  	,'wait=i'     => \$P4WAIT
+  	,'wait=i'     => \$SYNCWAIT
   	,'spot=s'     => \$SPOT
   	,'debug=s'    => \$D
   	,'verbose'    => \$V
   	,'help|?'  	  => \$help) or $help = 1;
-	$help = 1 unless $BRANCH;
+	$help = 1 unless $BRANCH && $AUTHOR;
 	help_exit() if $help;
-
 
 	$SPOT || $CHANGE || ! -f $MARKS or help_exit("Marks file exists ($MARKS), specify --change to continue");
 
@@ -272,20 +294,24 @@ sub get_opts {
 
 sub help_exit {
   my ($err) = @_;
-
 	print STDERR "ERROR: $err\n" if $err;
+	print STDERR $HELPSTR;
+	exit(1);
+	}
 
+sub helpstr {
 	my $name = basename($0);
 
-  print STDERR <<EOH;
+  return <<EOH;
 
 Usage: $name <options> DIR1 [DIR2, ...]
 
 Options:
 
   -a, --author   Author name to use for all commits
+                 Defaults to "$AUTHOR"
 
-  -b, --branch   Git branch to import into [ master ]
+  -b, --branch   Git branch to import into [ $BRANCH ]
 
   -m, --marks    git marks file [ ~/marks ]
   -c, --change   p4 changelist # of the last mark; required if marks file exists
@@ -298,14 +324,17 @@ Options:
                  rather than piping to git --fast-import.  You could cat this
                  file to fast-import later to get the same end result.
 
-  -w, --wait     Initial p4 command timeout in seconds [ 30 ].
-                 p4 hangs a lot, so p4 commands are retried if they don't complete
-                 within the timeout window.  retries use an exponential backoff
-                 strategy - timeout doubles each retry to a max of 10 minutes.
+  -w, --wait     Timeout for first call to p4 sync for a given dir [ $SYNCWAIT ]
+                 If sync fails or times out, we rm the whole directory and start
+                 over with "p4 sync -f" with 4x the timeout.
 
-  -s, --spot     spotcheck mode - sync both repos to given commit
+  -s, --spot     spotcheck mode - sync P4 and git to the given mark & diff
 
-Import the full P4 history of the given directories into the current git repo.
+Import the full P4 history of the given directories into the current git repo.  Note
+the given DIRS may be only a subset of the p4 repo, that's ok.
+
+Because p4 client commands can hang or otherwise misbehave, it's probably best to
+run $name from within the same LAN as the p4 server.  It's certainly faster this way.
 
 If a directory has moved in p4, you must provide both the old & new paths as arguments.
 
