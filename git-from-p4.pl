@@ -13,11 +13,11 @@ use warnings;
 #--------------------------------------------------------------------------------
 # global options, many configurable via Getopt::Long
 #--------------------------------------------------------------------------------
-my $AUTHOR    = 'John Hart <john.hart@ihance.com>';
 my $BRANCH    = 'master';
 my $BATCHSIZE = 10;
 my $MARKS     = $ENV{HOME} . '/marks';
 my $SYNCWAIT  = 240;
+my $AUTHOR;
 my $PREFIX;
 my $SPOT;
 my $CHANGE;
@@ -78,20 +78,21 @@ sub split_list {
 #--------------------------------------------------------------------------------
 sub spot_check {
 	my ($cl) = @_;
-	my $co = readcmd("git log master | grep -e commit -e '\\[Perforce change $cl' | grep -B1 '\\[Perforce change $cl' | cut -d' ' -f 2");
+	my $co = readcmd("git log master | grep -e commit -e '\\[Perforce change' | grep -B1 '\\[Perforce change $cl\\]' | cut -d' ' -f 2");
 	while (chomp($co)) {}
+	$co or die("No commit for changelist $cl, bailing\n");
 	readcmd("git checkout $co 2> /dev/null");
 	p4_sync($cl, @DIRS);
-	map { spot_check_dir($_) } @DIRS;
+	map { spot_check_dir($cl, $_) } @DIRS;
 	}
 
 sub spot_check_dir {
-	my ($d) = @_;
-	my ($gd) = git_path($_);
-	print("::SKIP - $d\n"), return unless -d $d && -d $gd;
+	my ($cl, $d) = @_;
+	my ($gd) = git_path($d);
+	print("::${cl}::SKIP - $d (missing '$gd' or '$d')\n"), return unless -d $d && -d $gd;
 	system(sprintf('diff -rbq %s %s', $gd, $d))
-		? print "::DIFF $gd\n"
-		: print "::GOOD $gd\n";
+		? print "::${cl}::DIFF $gd\n"
+		: print "::${cl}::GOOD $gd\n";
 	}
 
 #--------------------------------------------------------------------------------
@@ -281,15 +282,18 @@ sub get_opts {
   	,'debug=s'    => \$D
   	,'verbose'    => \$V
   	,'help|?'  	  => \$help) or $help = 1;
-	$help = 1 unless $BRANCH && $AUTHOR;
+	$help = 1 unless $BRANCH;
 	help_exit() if $help;
+
+	$AUTHOR ||= sprintf("%s <%s>", map { chomp; $_ } (`git config --get user.name`, `git config --get user.email`));
+	$AUTHOR or help_exit("Cannot determine author");
 
 	$SPOT || $CHANGE || ! -f $MARKS or help_exit("Marks file exists ($MARKS), specify --change to continue");
 
 	@DIRS = @ARGV or help_exit("Must specify at least one directory!");
-	map { s~/$~~ } @DIRS; # don't want trailing "/" in our dirs
-
 	$PREFIX ||= longest_common_prefix(@DIRS);
+
+	map { s~/$~~ } @DIRS; # don't want trailing "/" in our dirs (although it's good in PREFIX)
 	}
 
 sub help_exit {
@@ -308,8 +312,7 @@ Usage: $name <options> DIR1 [DIR2, ...]
 
 Options:
 
-  -a, --author   Author name to use for all commits
-                 Defaults to "$AUTHOR"
+  -a, --author   Author name to use for all commits; default pulls from git config
 
   -b, --branch   Git branch to import into [ $BRANCH ]
 
@@ -344,11 +347,25 @@ the longest common prefix of the DIRS will be used, but you can use -p to overri
 
 examples:
 
-  $name -p ../../oldsrc/ -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../oldsrc/bin
+$name -p ../../oldsrc/ -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../oldsrc/bin
 
-  $name                  -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../oldsrc/bin
+$name                  -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../oldsrc/bin
 
-Both commands will import "lib" and "bin" at the root of the current git repo.
+Both commands will import "lib" and "bin" at the root of the current git repo; you can 
+spot-check the import like so:
+
+# different for each import
+checkmark() { $name -s \$1 ../../oldsrc/lib ../../oldsrc/bin; }
+
+# same for all imports
+getmarks() { awk "NR % \$1 == 0" ~/marks | sed -e 's~:~~' -e 's~ .*~~'; }
+for f in `getmarks 10`; do checkmark \$f; done | grep '^::' # check every 10th
+
+To import the *contents* of a single directory, specify a trailing slash:
+
+$name /Users/john/p4src/source_home/aws/
+
+checkmark() { $name -s \$1 /Users/john/p4src/source_home/aws/; }
 
 EOH
 
