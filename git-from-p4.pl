@@ -217,9 +217,12 @@ sub redir_io {
 
 
 # elegant little LCP finder mod'd from http://linux.seindal.dk/2005/09/09/longest-common-prefix-in-perl
+# we only want full directories, so we shorten $prefix by directory chunks
+# lcp(qw(dir1/pfx2-a/file dir1/pfx2-b/file)) # returns  'dir1/' , not 'dir1/pfx2'
 sub longest_common_prefix {
 	my $prefix = shift;
-	map { chop $prefix while (! /^\Q$prefix\E/); } @_;
+	map { chop $prefix while (! /^\Q$prefix\E/); } @_; # trim to LCP string
+	while (! -d $prefix && chop($prefix)) {}  # trim to directory
 	$prefix;
 	}
 
@@ -334,7 +337,9 @@ Options:
   -s, --spot     spotcheck mode - sync P4 and git to the given mark & diff
 
 Import the full P4 history of the given directories into the current git repo.  Note
-the given DIRS may be only a subset of the p4 repo, that's ok.
+the given DIRS may be only a subset of the p4 repo, that's ok.  Note that this process
+doesn't actually touch your current working directory, so you will probably want
+to 'git reset --hard' afterward to sync your CWD.
 
 Because p4 client commands can hang or otherwise misbehave, it's probably best to
 run $name from within the same LAN as the p4 server.  It's certainly faster this way.
@@ -351,21 +356,21 @@ $name -p ../../oldsrc/ -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../olds
 
 $name                  -a 'Bob Jones <bj\@yada.com>' ../../oldsrc/lib ../../oldsrc/bin
 
-Both commands will import "lib" and "bin" at the root of the current git repo; you can 
-spot-check the import like so:
-
-# different for each import
-checkmark() { $name -s \$1 ../../oldsrc/lib ../../oldsrc/bin; }
-
-# same for all imports
-getmarks() { awk "NR % \$1 == 0" ~/marks | sed -e 's~:~~' -e 's~ .*~~'; }
-for f in `getmarks 10`; do checkmark \$f; done | grep '^::' # check every 10th
+Both commands will import "lib" and "bin" at the root of the current git repo.
 
 To import the *contents* of a single directory, specify a trailing slash:
 
-$name /Users/john/p4src/source_home/aws/
+$name ../../oldsrc/aws/
 
-checkmark() { $name -s \$1 /Users/john/p4src/source_home/aws/; }
+
+You can spot-check imports like so:
+
+# define this function with your unique directory args:
+checkmark() { $name -s \$1 ../../oldsrc/lib ../../oldsrc/bin; }
+
+# then run these:
+getmarks() { awk "NR % \$1 == 0" ~/marks | sed -e 's~:~~' -e 's~ .*~~'; }
+for f in `getmarks 10`; do checkmark \$f; done | grep '^::' # check every 10th
 
 EOH
 
