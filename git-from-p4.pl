@@ -315,7 +315,7 @@ Usage: $name <options> DIR1 [DIR2, ...]
 
 Options:
 
-  -a, --author   Author name to use for all commits; default pulls from git config
+  -a, --author   Author name to use for (all!) commits; default pulls from git config
 
   -b, --branch   Git branch to import into [ $BRANCH ]
 
@@ -338,7 +338,7 @@ Options:
 
 Import the full P4 history of the given directories into the current git repo.  Note
 the given DIRS may be only a subset of the p4 repo, that's ok.  Note that this process
-doesn't actually touch your current working directory, so you will probably want
+doesn't actually touch your working tree, so you will probably want
 to 'git reset --hard' afterward to sync your CWD.
 
 Because p4 client commands can hang or otherwise misbehave, it's probably best to
