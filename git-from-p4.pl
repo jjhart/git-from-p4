@@ -45,7 +45,7 @@ exit(0);
 #--------------------------------------------------------------------------------
 
 # open the GIT output handle as a pipe to git fast import (git_import_cmd())
-# then calling import_cl for each changelist
+# then call import_cl for each changelist
 sub do_cl_batch {
 	my ($cls, @dirs) = @_;
 	redir_io( sub { map { do_cl($_, @dirs) } @$cls; }, git_import_cmd());
@@ -274,17 +274,17 @@ sub get_opts {
 	my ($help) = 0;
 	
   GetOptions(
-  	 'author=s'   => \$AUTHOR
-  	,'branch=s'   => \$BRANCH
-  	,'mark=s' 	  => \$MARKS
-  	,'prefix=s'   => \$PREFIX
-  	,'change=i'   => \$CHANGE
-  	,'last=i'     => \$LAST
-  	,'wait=i'     => \$SYNCWAIT
-  	,'spot=s'     => \$SPOT
-  	,'debug=s'    => \$D
-  	,'verbose'    => \$V
-  	,'help|?'  	  => \$help) or $help = 1;
+     'author=s'   => \$AUTHOR
+    ,'branch=s'   => \$BRANCH
+    ,'mark=s'     => \$MARKS
+    ,'prefix=s'   => \$PREFIX
+    ,'change=i'   => \$CHANGE
+    ,'last=i'     => \$LAST
+    ,'wait=i'     => \$SYNCWAIT
+    ,'spot=s'     => \$SPOT
+    ,'debug=s'    => \$D
+    ,'verbose'    => \$V
+    ,'help|?'     => \$help) or $help = 1;
 	$help = 1 unless $BRANCH;
 	help_exit() if $help;
 
@@ -349,6 +349,10 @@ If a directory has moved in p4, you must provide both the old & new paths as arg
 As this command must be run from the git directory, the DIR arguments will necessarily
 be prefixed with a bunch of stuff (relative "../../" or absolute paths).  By default,
 the longest common prefix of the DIRS will be used, but you can use -p to override this.
+
+Note that "git fast import" uses a marks file (specified as --marks here) to track
+its state; if you end up wanting to re-run your import you will have to delete
+the old marks file.
 
 examples:
 
